@@ -1,92 +1,87 @@
 package tinkerbell
 
 import (
-	"encoding/json"
+	"context"
 	"errors"
 	"fmt"
 	"github.com/kubermatic/machine-controller/pkg/cloudprovider/provider/baremetal/plugins"
-	"io/ioutil"
-	"net/http"
-	"net/url"
-	"time"
+	tinkerbellclient "github.com/kubermatic/machine-controller/pkg/cloudprovider/provider/baremetal/plugins/tinkerbell/client"
+	tinkclient "github.com/tinkerbell/tink/client"
+	"github.com/tinkerbell/tink/pkg"
+	"github.com/tinkerbell/tink/protos/template"
+	"gopkg.in/yaml.v3"
 )
-
-const defaultTimeout = 10 * time.Second
 
 type driver struct {
 	tinkServerAddress string
+	imageRepoAddress  string
 
-	client   *http.Client
-	username string
-	password string
+	hardwareClient *tinkerbellclient.Hardware
+	templateClient *tinkerbellclient.Template
+	workflowClient *tinkerbellclient.Workflow
 }
 
 // NewTinkerbellDriver returns a new TinkerBell driver with a configured tinkserver address and a client timeout.
-func NewTinkerbellDriver(tinkServerAddress, username, password string, timeout time.Duration) (*driver, error) {
-	if tinkServerAddress == "" || username == "" || password == "" {
-		return nil, errors.New("tink-server address, username or server cannot be empty")
+func NewTinkerbellDriver(tinkServerAddress, imageRepoAddress string) (*driver, error) {
+	if tinkServerAddress == "" || imageRepoAddress == "" {
+		return nil, errors.New("tink-server address, imageRepoAddress cannot be empty")
 	}
 
-	if timeout == 0 {
-		timeout = defaultTimeout
+	if err := tinkclient.Setup(); err != nil {
+		return nil, fmt.Errorf("failed to setup tink-server client: %v", err)
 	}
 
 	d := &driver{
 		tinkServerAddress: tinkServerAddress,
-		client: &http.Client{
-			Transport: &http.Transport{
-				TLSHandshakeTimeout: timeout,
-			},
-			Timeout: timeout,
-		},
-		username: username,
-		password: password,
+		imageRepoAddress:  imageRepoAddress,
+		hardwareClient:    tinkerbellclient.NewHardwareClient(tinkclient.HardwareClient),
+		workflowClient:    tinkerbellclient.NewWorkflowClient(tinkclient.WorkflowClient, tinkerbellclient.NewHardwareClient(tinkclient.HardwareClient)),
+		templateClient:    tinkerbellclient.NewTemplateClient(tinkclient.TemplateClient),
 	}
 
 	return d, nil
 }
-func (d *driver) GetServer(serverId string) (plugins.Server, error) {
+func (d *driver) GetServer(ctx context.Context, serverId, macAddress, ipAddress string) (plugins.Server, error) {
 	if serverId == "" {
 		return nil, errors.New("server id cannot be empty")
 	}
 
-	requestUrl := url.URL{
-		Host:   d.tinkServerAddress,
-		Path:   fmt.Sprintf("/v1/hardware/%s", serverId),
-		Scheme: "http",
-		User:   url.UserPassword(d.username, d.password),
-	}
-	getRequest, err := http.NewRequest(http.MethodGet, requestUrl.String(), nil)
+	hw, err := d.hardwareClient.Get(ctx, serverId, ipAddress, macAddress)
 	if err != nil {
-		return nil, fmt.Errorf("failed to build get servers request: %v", err)
+		return nil, fmt.Errorf("failed to get hardware: %v", err)
 	}
 
-	res, err := d.client.Do(getRequest)
-	if err != nil {
-		return nil, fmt.Errorf("failed to execute get server request: %v", err)
-	}
-
-	data, err := ioutil.ReadAll(res.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read the get server response: %v", err)
-	}
-
-	server := &Hardware{}
-	if err := json.Unmarshal(data, server); err != nil {
-		return nil, fmt.Errorf("failed to unmrashal server data: %v", err)
-	}
-
-	return server, nil
+	return &Hardware{
+		Spec: pkg.HardwareWrapper{
+			hw,
+		},
+	}, nil
 }
 
-func (d *driver) ListServers() ([]plugins.Server, error) {
-	panic("implement me")
+func (d *driver) ProvisionServer(ctx context.Context, server plugins.Server) (string, error) {
+	hw := server.(*Hardware).Spec.Hardware
+	if err := d.hardwareClient.Create(ctx, hw); err != nil {
+		return "", fmt.Errorf("failed to register hardware to tink-server: %v", err)
+	}
+
+	tmpl := createTemplate(server.GetMACAddress(), d.tinkServerAddress, d.imageRepoAddress)
+	payload, err := yaml.Marshal(tmpl)
+	if err != nil {
+		return "", fmt.Errorf("failed marshalling workflow template: %v", err)
+	}
+
+	workflowTemplate := &template.WorkflowTemplate{
+		Name: tmpl.Name,
+		Data: string(payload),
+	}
+
+	if err := d.templateClient.Create(ctx, workflowTemplate); err != nil {
+		return "", fmt.Errorf("failed to create workflow template: %v", err)
+	}
+
+	return d.workflowClient.Create(ctx, workflowTemplate.Id, server.GetID())
 }
 
-func (d *driver) ProvisionServer() (string, error) {
-	panic("implement me")
-}
-
-func (d *driver) DeprovisionServer() error {
-	panic("implement me")
+func (d *driver) DeprovisionServer(serverId string) (string, error) {
+	return "", nil
 }
